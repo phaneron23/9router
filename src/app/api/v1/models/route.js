@@ -12,6 +12,7 @@ import { resolveKimchiModels } from "open-sse/services/kimchiModels.js";
 import { resolveQoderModels } from "open-sse/services/qoderModels.js";
 import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
 import { resolveClinepassModels } from "open-sse/services/clinepassModels.js";
+import { FILTERS as SUGGESTED_MODEL_FILTERS } from "@/app/api/providers/suggested-models/filters.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { capabilitiesFromServiceKind } from "open-sse/providers/capabilities.js";
 
@@ -168,6 +169,38 @@ async function fetchCompatibleModelIds(connection) {
   }
 }
 
+async function fetchModelsFromFetcher(fetcher) {
+  if (!fetcher?.url || !fetcher?.type) return [];
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const response = await fetch(fetcher.url, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) return [];
+
+    const json = await response.json();
+    const raw = json?.data ?? json?.models ?? json?.results ?? json;
+    const filter = SUGGESTED_MODEL_FILTERS[fetcher.type];
+    const filtered = filter ? filter(Array.isArray(raw) ? raw : []) : parseOpenAIStyleModels(json);
+
+    return Array.from(
+      new Set(
+        (Array.isArray(filtered) ? filtered : [])
+          .map((model) => model?.id || model?.name || model?.model)
+          .filter((modelId) => typeof modelId === "string" && modelId.trim() !== "")
+      )
+    );
+  } catch {
+    return [];
+  }
+}
+
 // Provider matches kindFilter when its serviceKinds intersect the requested kinds.
 // LLM is the default kind for providers missing serviceKinds.
 function providerMatchesKinds(providerId, kindFilter) {
@@ -231,6 +264,13 @@ export async function buildModelsList(kindFilter) {
   for (const conn of connections) {
     if (!activeConnectionByProvider.has(conn.provider)) {
       activeConnectionByProvider.set(conn.provider, conn);
+    }
+  }
+  for (const [providerId, providerInfo] of Object.entries(AI_PROVIDERS)) {
+    if (!providerInfo?.noAuth) continue;
+    if (!providerMatchesKinds(providerId, kindFilter)) continue;
+    if (!activeConnectionByProvider.has(providerId)) {
+      activeConnectionByProvider.set(providerId, null);
     }
   }
 
@@ -321,6 +361,10 @@ export async function buildModelsList(kindFilter) {
 
       if (isCompatibleProvider && rawModelIds.length === 0 && !UPSTREAM_CONNECTION_RE.test(providerId)) {
         rawModelIds = await fetchCompatibleModelIds(conn);
+      }
+
+      if (rawModelIds.length === 0 && AI_PROVIDERS[providerId]?.noAuth) {
+        rawModelIds = await fetchModelsFromFetcher(AI_PROVIDERS[providerId]?.modelsFetcher);
       }
 
       // Config-driven live catalog override (e.g. Kiro returns dynamic
